@@ -602,6 +602,18 @@ fn handle_justfile(
     dry_run: bool,
     verbose: bool,
 ) -> Result<bool> {
+    // Only create justfile if moon.mod.json exists at repo root (MoonBit project root)
+    let moon_mod_at_root = repo_root.join("moon.mod.json").exists();
+    if !moon_mod_at_root {
+        if verbose {
+            println!(
+                "[{}] Skipping justfile (no moon.mod.json at root)",
+                repo_root.display()
+            );
+        }
+        return Ok(false);
+    }
+
     let justfile_path = repo_root.join("justfile");
     let exists = justfile_path.exists();
 
