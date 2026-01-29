@@ -1,4 +1,7 @@
 # moon-dst
+<!-- bdg:begin -->
+[![crates.io](https://img.shields.io/crates/v/moon-dst.svg)](https://crates.io/crates/moon-dst)
+<!-- bdg:end -->
 
 MoonBit プロジェクトの依存を強制的に更新する CLI ツール。
 
@@ -74,3 +77,5 @@ moon-dst just --root .
 ## ライセンス
 
 MIT
+
+
