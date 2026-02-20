@@ -74,8 +74,37 @@ moon-dst just --root .
 - `.` で始まるフォルダ（`.git`, `.moon`, `.mooncakes` など）
 - `target`, `node_modules`, `dist`, `build`, `vendor`, `skills`
 
+## Tracing (OpenTelemetry / Jaeger)
+
+`moon-dst` は OTLP endpoint が設定されているときだけ trace を export します。  
+`OTEL_EXPORTER_OTLP_ENDPOINT` 未設定時は no-op で動作し、従来の挙動を維持します。
+
+### ローカルで確認
+
+```bash
+# Jaeger 起動
+just jaeger-up
+
+# trace 付きで scan 実行
+just trace-scan
+
+# UI を開く
+just trace-ui
+```
+
+Jaeger UI: `http://localhost:16686`  
+Search で service=`moon-dst`（または `OTEL_SERVICE_NAME`）を選ぶと span が確認できます。
+
+### 主な環境変数
+
+| 環境変数 | 説明 |
+|---------|------|
+| `OTEL_EXPORTER_OTLP_ENDPOINT` | OTLP exporter の endpoint（例: `http://localhost:4317`） |
+| `OTEL_SERVICE_NAME` | `service.name` の上書き |
+| `OTEL_TRACES_SAMPLER` | sampler 名（例: `parentbased_traceidratio`, `always_on`） |
+| `OTEL_TRACES_SAMPLER_ARG` | sampler 引数（例: trace id ratio の `1.0`） |
+
 ## ライセンス
 
 MIT
-
 

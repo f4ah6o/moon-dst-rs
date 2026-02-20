@@ -1,8 +1,12 @@
 // SPDX-License-Identifier: MIT
 //! moon-dst: MoonBit dependency updater CLI
 
+mod telemetry;
+mod telemetry_span;
+
 use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand, ValueEnum};
+use opentelemetry::KeyValue;
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -10,6 +14,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
+use telemetry::{mask_cli_args, RootAttrs, Telemetry};
 use walkdir::WalkDir;
 
 // =============================================================================
@@ -223,29 +228,82 @@ release-check: fmt info check test
 // =============================================================================
 
 fn main() -> ExitCode {
-    let cli = Cli::parse();
+    let raw_args: Vec<String> = std::env::args().collect();
+    let command_hint = infer_command_hint(&raw_args);
+    let root_span_name = format!("cli.{command_hint}");
+    let cwd = std::env::current_dir()
+        .unwrap_or_else(|_| PathBuf::from("."))
+        .display()
+        .to_string();
 
-    match run(cli) {
-        Ok(success) => {
-            if success {
-                ExitCode::SUCCESS
-            } else {
-                ExitCode::from(1)
-            }
+    let root_attrs = RootAttrs {
+        cli_command: command_hint,
+        cli_args: mask_cli_args(&raw_args.iter().skip(1).cloned().collect::<Vec<_>>()),
+        cwd,
+    };
+    let mut telemetry = telemetry::init(&root_span_name, root_attrs);
+
+    let run_result = telemetry_span::with_span(
+        &telemetry,
+        telemetry.root_span_name(),
+        telemetry.root_attributes(),
+        || run_entrypoint(&telemetry, &raw_args),
+    );
+
+    let exit = match run_result {
+        Ok(code) => code,
+        Err(EntryError::Parse(parse_err)) => {
+            let _ = parse_err.print();
+            exit_code_from_i32(parse_err.exit_code())
         }
-        Err(e) => {
+        Err(EntryError::Runtime(e)) => {
             eprintln!("Error: {e:#}");
             ExitCode::from(1)
+        }
+    };
+
+    telemetry.shutdown();
+    exit
+}
+
+enum EntryError {
+    Parse(clap::Error),
+    Runtime(anyhow::Error),
+}
+
+impl std::fmt::Display for EntryError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            EntryError::Parse(err) => write!(f, "{err}"),
+            EntryError::Runtime(err) => write!(f, "{err}"),
         }
     }
 }
 
-fn run(cli: Cli) -> Result<bool> {
-    // Check moon CLI availability
-    check_moon_available()?;
+fn run_entrypoint(
+    telemetry: &Telemetry,
+    raw_args: &[String],
+) -> std::result::Result<ExitCode, EntryError> {
+    let cli = telemetry_span::with_span(telemetry, "parse_args", &[], || {
+        Cli::try_parse_from(raw_args.iter().cloned()).map_err(EntryError::Parse)
+    })?;
+
+    let success = run(telemetry, cli).map_err(EntryError::Runtime)?;
+    if success {
+        Ok(ExitCode::SUCCESS)
+    } else {
+        Ok(ExitCode::from(1))
+    }
+}
+
+fn run(telemetry: &Telemetry, cli: Cli) -> Result<bool> {
+    telemetry_span::with_span(telemetry, "load_config", &[], || {
+        check_moon_available()?;
+        Ok::<(), anyhow::Error>(())
+    })?;
 
     match cli.command {
-        Commands::Scan { common, json } => cmd_scan(common, json),
+        Commands::Scan { common, json } => cmd_scan(telemetry, common, json),
         Commands::Apply {
             common,
             skip_update,
@@ -255,6 +313,7 @@ fn run(cli: Cli) -> Result<bool> {
             no_justfile,
             justfile_mode,
         } => cmd_apply(
+            telemetry,
             common,
             skip_update,
             repeat,
@@ -263,7 +322,32 @@ fn run(cli: Cli) -> Result<bool> {
             !no_justfile,
             justfile_mode,
         ),
-        Commands::Just { common, mode } => cmd_just(common, mode),
+        Commands::Just { common, mode } => cmd_just(telemetry, common, mode),
+    }
+}
+
+fn infer_command_hint(args: &[String]) -> String {
+    for arg in args.iter().skip(1) {
+        if arg.starts_with('-') {
+            continue;
+        }
+        return match arg.as_str() {
+            "scan" | "apply" | "just" => arg.clone(),
+            _ => "unknown".to_string(),
+        };
+    }
+    "unknown".to_string()
+}
+
+fn input_path_attr(path: &Path) -> KeyValue {
+    KeyValue::new("input_path", path.display().to_string())
+}
+
+fn exit_code_from_i32(code: i32) -> ExitCode {
+    if (0..=255).contains(&code) {
+        ExitCode::from(code as u8)
+    } else {
+        ExitCode::from(1)
     }
 }
 
@@ -304,61 +388,85 @@ fn check_moon_available() -> Result<()> {
 // Scan Command
 // =============================================================================
 
-fn cmd_scan(common: CommonOptions, json_output: bool) -> Result<bool> {
-    let repos = discover_repos(&common)?;
+fn cmd_scan(telemetry: &Telemetry, common: CommonOptions, json_output: bool) -> Result<bool> {
+    let repos = telemetry_span::with_span(
+        telemetry,
+        "load_inputs",
+        &[input_path_attr(&common.root)],
+        || discover_repos(&common),
+    )?;
 
     if json_output {
-        let output = ScanOutput {
-            repos: repos
-                .iter()
-                .map(|r| RepoOutput {
-                    repo_root: r.root.display().to_string(),
-                    moon_mods: r
-                        .moon_mods
-                        .iter()
-                        .map(|m| MoonModOutput {
-                            path: m
-                                .path
-                                .strip_prefix(&r.root)
-                                .unwrap_or(&m.path)
-                                .display()
-                                .to_string(),
-                            deps: m.deps.clone(),
-                        })
-                        .collect(),
-                })
-                .collect(),
-        };
-        println!("{}", serde_json::to_string_pretty(&output)?);
+        let output_json = telemetry_span::with_span(telemetry, "main_operation", &[], || {
+            let output = ScanOutput {
+                repos: repos
+                    .iter()
+                    .map(|r| RepoOutput {
+                        repo_root: r.root.display().to_string(),
+                        moon_mods: r
+                            .moon_mods
+                            .iter()
+                            .map(|m| MoonModOutput {
+                                path: m
+                                    .path
+                                    .strip_prefix(&r.root)
+                                    .unwrap_or(&m.path)
+                                    .display()
+                                    .to_string(),
+                                deps: m.deps.clone(),
+                            })
+                            .collect(),
+                    })
+                    .collect(),
+            };
+            Ok::<String, anyhow::Error>(serde_json::to_string_pretty(&output)?)
+        })?;
+
+        telemetry_span::with_span(telemetry, "write_outputs", &[], || {
+            println!("{output_json}");
+            Ok::<(), anyhow::Error>(())
+        })?;
     } else {
-        for repo in &repos {
-            println!("Repository: {}", repo.root.display());
-            for moon_mod in &repo.moon_mods {
-                let rel_path = moon_mod
-                    .path
-                    .strip_prefix(&repo.root)
-                    .unwrap_or(&moon_mod.path);
-                println!("  {}", rel_path.display());
-                for dep in &moon_mod.deps {
-                    println!("    - {dep}");
+        let lines = telemetry_span::with_span(telemetry, "main_operation", &[], || {
+            let mut lines = Vec::new();
+            for repo in &repos {
+                lines.push(format!("Repository: {}", repo.root.display()));
+                for moon_mod in &repo.moon_mods {
+                    let rel_path = moon_mod
+                        .path
+                        .strip_prefix(&repo.root)
+                        .unwrap_or(&moon_mod.path);
+                    lines.push(format!("  {}", rel_path.display()));
+                    for dep in &moon_mod.deps {
+                        lines.push(format!("    - {dep}"));
+                    }
                 }
+                lines.push(String::new());
             }
-            println!();
-        }
 
-        let total_mods: usize = repos.iter().map(|r| r.moon_mods.len()).sum();
-        let total_deps: usize = repos
-            .iter()
-            .flat_map(|r| &r.moon_mods)
-            .map(|m| m.deps.len())
-            .sum();
+            let total_mods: usize = repos.iter().map(|r| r.moon_mods.len()).sum();
+            let total_deps: usize = repos
+                .iter()
+                .flat_map(|r| &r.moon_mods)
+                .map(|m| m.deps.len())
+                .sum();
 
-        println!(
-            "Summary: {} repos, {} moon.mod.json files, {} dependencies",
-            repos.len(),
-            total_mods,
-            total_deps
-        );
+            lines.push(format!(
+                "Summary: {} repos, {} moon.mod.json files, {} dependencies",
+                repos.len(),
+                total_mods,
+                total_deps
+            ));
+
+            Ok::<Vec<String>, anyhow::Error>(lines)
+        })?;
+
+        telemetry_span::with_span(telemetry, "write_outputs", &[], || {
+            for line in &lines {
+                println!("{line}");
+            }
+            Ok::<(), anyhow::Error>(())
+        })?;
     }
 
     Ok(true)
@@ -369,6 +477,7 @@ fn cmd_scan(common: CommonOptions, json_output: bool) -> Result<bool> {
 // =============================================================================
 
 fn cmd_apply(
+    telemetry: &Telemetry,
     common: CommonOptions,
     skip_update: bool,
     repeat: u32,
@@ -377,88 +486,95 @@ fn cmd_apply(
     write_justfile: bool,
     justfile_mode: JustfileMode,
 ) -> Result<bool> {
-    let repos = discover_repos(&common)?;
+    let repos = telemetry_span::with_span(
+        telemetry,
+        "load_inputs",
+        &[input_path_attr(&common.root)],
+        || discover_repos(&common),
+    )?;
 
     if repos.is_empty() {
-        println!("No moon.mod.json files found.");
+        telemetry_span::with_span(telemetry, "write_outputs", &[], || {
+            println!("No moon.mod.json files found.");
+            Ok::<(), anyhow::Error>(())
+        })?;
         return Ok(true);
     }
 
-    // Configure thread pool
-    let jobs = common.jobs.unwrap_or_else(|| num_cpus::get() / 2).max(1);
-    rayon::ThreadPoolBuilder::new()
-        .num_threads(jobs)
-        .build_global()
-        .ok(); // Ignore if already initialized
+    let results = telemetry_span::with_span(telemetry, "main_operation", &[], || {
+        // Configure thread pool
+        let jobs = common.jobs.unwrap_or_else(|| num_cpus::get() / 2).max(1);
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(jobs)
+            .build_global()
+            .ok(); // Ignore if already initialized
 
-    let verbose = common.verbose;
-    let dry_run = common.dry_run;
+        let verbose = common.verbose;
+        let dry_run = common.dry_run;
 
-    // Track if we should stop early
-    let should_stop = AtomicBool::new(false);
-    let results: Mutex<Vec<RepoResult>> = Mutex::new(Vec::new());
+        // Track if we should stop early
+        let should_stop = AtomicBool::new(false);
+        let results: Mutex<Vec<RepoResult>> = Mutex::new(Vec::new());
 
-    repos.par_iter().for_each(|repo| {
-        if fail_fast && should_stop.load(Ordering::Relaxed) {
-            return;
-        }
+        repos.par_iter().for_each(|repo| {
+            if fail_fast && should_stop.load(Ordering::Relaxed) {
+                return;
+            }
 
-        let result = process_repo(
-            repo,
-            skip_update,
-            repeat,
-            &packages,
-            dry_run,
-            verbose,
-            write_justfile,
-            justfile_mode,
-        );
+            let result = process_repo(
+                repo,
+                skip_update,
+                repeat,
+                &packages,
+                dry_run,
+                verbose,
+                write_justfile,
+                justfile_mode,
+            );
 
-        let success = result.success;
-        results.lock().unwrap().push(result);
+            let success = result.success;
+            results.lock().unwrap().push(result);
 
-        if fail_fast && !success {
-            should_stop.store(true, Ordering::Relaxed);
-        }
-    });
+            if fail_fast && !success {
+                should_stop.store(true, Ordering::Relaxed);
+            }
+        });
 
-    // Print results
-    let results = results.into_inner().unwrap();
-    let mut all_success = true;
+        Ok::<Vec<RepoResult>, anyhow::Error>(results.into_inner().unwrap())
+    })?;
 
-    println!("\n=== Results ===\n");
-    for result in &results {
-        let status = if result.success { "OK" } else { "FAILED" };
-        println!("[{status}] {}", result.repo_root.display());
+    telemetry_span::with_span(telemetry, "write_outputs", &[], || {
+        println!("\n=== Results ===\n");
+        for result in &results {
+            let status = if result.success { "OK" } else { "FAILED" };
+            println!("[{status}] {}", result.repo_root.display());
 
-        if !result.updated_packages.is_empty() {
-            println!("  Updated: {} packages", result.updated_packages.len());
-        }
+            if !result.updated_packages.is_empty() {
+                println!("  Updated: {} packages", result.updated_packages.len());
+            }
 
-        if !result.failed_packages.is_empty() {
-            println!("  Failed packages:");
-            for (pkg, err) in &result.failed_packages {
-                println!("    - {pkg}: {err}");
+            if !result.failed_packages.is_empty() {
+                println!("  Failed packages:");
+                for (pkg, err) in &result.failed_packages {
+                    println!("    - {pkg}: {err}");
+                }
+            }
+
+            for err in &result.errors {
+                println!("  Error: {err}");
             }
         }
 
-        for err in &result.errors {
-            println!("  Error: {err}");
-        }
+        let success_count = results.iter().filter(|r| r.success).count();
+        println!(
+            "\nSummary: {}/{} repos succeeded",
+            success_count,
+            results.len()
+        );
+        Ok::<(), anyhow::Error>(())
+    })?;
 
-        if !result.success {
-            all_success = false;
-        }
-    }
-
-    let success_count = results.iter().filter(|r| r.success).count();
-    println!(
-        "\nSummary: {}/{} repos succeeded",
-        success_count,
-        results.len()
-    );
-
-    Ok(all_success)
+    Ok(results.iter().all(|r| r.success))
 }
 
 fn process_repo(
@@ -564,35 +680,52 @@ fn run_moon_command(args: &[&str], cwd: &Path) -> Result<String> {
 // Just Command
 // =============================================================================
 
-fn cmd_just(common: CommonOptions, mode: JustfileMode) -> Result<bool> {
-    let repos = discover_repos(&common)?;
+fn cmd_just(telemetry: &Telemetry, common: CommonOptions, mode: JustfileMode) -> Result<bool> {
+    let repos = telemetry_span::with_span(
+        telemetry,
+        "load_inputs",
+        &[input_path_attr(&common.root)],
+        || discover_repos(&common),
+    )?;
 
     if repos.is_empty() {
-        println!("No moon.mod.json files found.");
+        telemetry_span::with_span(telemetry, "write_outputs", &[], || {
+            println!("No moon.mod.json files found.");
+            Ok::<(), anyhow::Error>(())
+        })?;
         return Ok(true);
     }
 
-    let dry_run = common.dry_run;
-    let verbose = common.verbose;
-    let mut success_count = 0;
-    let mut skip_count = 0;
+    let (success_count, skip_count) =
+        telemetry_span::with_span(telemetry, "main_operation", &[], || {
+            let dry_run = common.dry_run;
+            let verbose = common.verbose;
+            let mut success_count = 0;
+            let mut skip_count = 0;
 
-    for repo in &repos {
-        match handle_justfile(&repo.root, mode, dry_run, verbose) {
-            Ok(created) => {
-                if created {
-                    success_count += 1;
-                } else {
-                    skip_count += 1;
+            for repo in &repos {
+                match handle_justfile(&repo.root, mode, dry_run, verbose) {
+                    Ok(created) => {
+                        if created {
+                            success_count += 1;
+                        } else {
+                            skip_count += 1;
+                        }
+                    }
+                    Err(e) => {
+                        eprintln!("[{}] Error: {e}", repo.root.display());
+                    }
                 }
             }
-            Err(e) => {
-                eprintln!("[{}] Error: {e}", repo.root.display());
-            }
-        }
-    }
 
-    println!("\nSummary: {success_count} created, {skip_count} skipped");
+            Ok::<(usize, usize), anyhow::Error>((success_count, skip_count))
+        })?;
+
+    telemetry_span::with_span(telemetry, "write_outputs", &[], || {
+        println!("\nSummary: {success_count} created, {skip_count} skipped");
+        Ok::<(), anyhow::Error>(())
+    })?;
+
     Ok(true)
 }
 
@@ -796,5 +929,21 @@ mod tests {
         assert!(should_ignore(Path::new("/foo/.git/config"), &ignores));
         assert!(should_ignore(Path::new("/foo/.hidden"), &ignores));
         assert!(!should_ignore(Path::new("/foo/src/main.rs"), &ignores));
+    }
+
+    #[test]
+    fn test_infer_command_hint() {
+        assert_eq!(
+            infer_command_hint(&["moon-dst".to_string(), "scan".to_string()]),
+            "scan"
+        );
+        assert_eq!(
+            infer_command_hint(&["moon-dst".to_string(), "--help".to_string()]),
+            "unknown"
+        );
+        assert_eq!(
+            infer_command_hint(&["moon-dst".to_string(), "foo".to_string()]),
+            "unknown"
+        );
     }
 }
