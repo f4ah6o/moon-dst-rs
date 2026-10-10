@@ -476,6 +476,7 @@ fn cmd_scan(telemetry: &Telemetry, common: CommonOptions, json_output: bool) -> 
 // Apply Command
 // =============================================================================
 
+#[allow(clippy::too_many_arguments)]
 fn cmd_apply(
     telemetry: &Telemetry,
     common: CommonOptions,
@@ -577,6 +578,7 @@ fn cmd_apply(
     Ok(results.iter().all(|r| r.success))
 }
 
+#[allow(clippy::too_many_arguments)]
 fn process_repo(
     repo: &RepoInfo,
     skip_update: bool,
